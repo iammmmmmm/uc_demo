@@ -10,6 +10,28 @@
 // ----------------------------------------------------
 // 1. 抽象基类 (hookDad)
 // ----------------------------------------------------
+/**
+ * @brief 把外设模型的值种回 guest 内存。
+ *
+ * 为什么需要: Unicorn 的读 Hook 在读取完成之后才触发, 改不了本次读到的值 ——
+ * 固件读到的始终是映射 RAM 里的内容。所以要主动把模型状态写回内存, 让固件后续的读
+ * (含 `|=` / `&=` 这类读-改-写) 看到正确的寄存器内容。
+ */
+inline void plantValueToGuest(uc_engine *uc, uint64_t address, int size, uint32_t value) {
+    if (uc == nullptr) {
+        return;
+    }
+    if (size == 4) {
+        uc_mem_write(uc, address, &value, 4);
+    } else if (size == 1 || size == 2) {
+        const uint8_t bytes[2] = {
+            static_cast<uint8_t>(value & 0xFF),
+            static_cast<uint8_t>((value >> 8) & 0xFF),
+        };
+        uc_mem_write(uc, address, bytes, size);
+    }
+}
+
 class PeripheralDevice {
   public:
     virtual ~PeripheralDevice() = default;
@@ -42,6 +64,16 @@ class PeripheralDevice {
      * @brief 获取外设名称
      */
     virtual std::string getName();
+
+    /**
+     * @brief 把本设备的寄存器复位值种进 guest 内存 (启动时调用一次)。
+     *
+     * 为什么必须这么做: Unicorn 的读 Hook 在读取完成之后才触发, 改不了本次读到的值 ——
+     * 固件读到的始终是映射 RAM 里的内容。若不把复位值写进 RAM, 固件会一律读到 0,
+     * 例如 RCM_GetMasterClockFreq() 会返回 0, 固件的 APM_DelayInit() 就会因
+     * SysTick_Config(0) 失败而卡在 while(1)。
+     */
+    virtual void plantInitialValues(uc_engine *uc) { (void) uc; }
 };
 
 // ----------------------------------------------------

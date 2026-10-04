@@ -48,6 +48,7 @@ class USART : public PeripheralDevice {
     USART( uint64_t base_address,const std::string& name);
     bool handle_write(uc_engine *uc, uint64_t address, int size, int64_t value) override;
     bool handle_read(uc_engine *uc, uint64_t address, int size, int64_t *read_value) override;
+    void plantInitialValues(uc_engine *uc) override;
     uint64_t getBaseAddress() override { return m_base_address; }
     std::string getName() override { return m_name; }
 };

@@ -42,59 +42,85 @@ void USART::initialize_registers() {
 }
 
 
+// 把寄存器复位值种进 guest 内存。固件读的是映射 RAM (Unicorn 的读 Hook 改不了本次读到的
+// 值), 不种进去的话 STS 会读成 0: TXBEF 不为 1, 固件 io_putchar() 里的
+// while(...== RESET && timeout--) 每发一个字节都要空转到超时。
+void USART::plantInitialValues(uc_engine *uc) {
+    if (uc == nullptr) {
+        return;
+    }
+    for (const auto &[offset, reg] : m_registers) {
+        plantValueToGuest(uc, m_base_address + offset, 4, reg->read());
+    }
+}
+
 // 处理写入操作
 bool USART::handle_write(uc_engine *uc, uint64_t address, int size, int64_t value) {
-    if (size != 4) {
-        std::cerr << "   [" << getName() << " W] 警告: 非 32 位写入操作被忽略. 地址: 0x" << std::hex << address << std::endl;
+    const auto offset = static_cast<uint32_t>(address - m_base_address);
+
+    if (!m_registers.contains(offset)) {
+        std::cerr << "   [" << getName() << " W: 0x" << std::hex << offset << "] 警告: 访问未注册寄存器!" << std::endl;
         return true;
     }
 
-    const auto offset = static_cast<uint32_t>(address - m_base_address);
-    const auto new_value = static_cast<uint32_t>(value);
-
-    if (m_registers.contains(offset)) {
-        m_registers[offset]->write(new_value);
-
-#if IS_DEBUG
-        std::cout << "   [" << getName() << " W: 0x" << std::hex << std::setw(2) << std::setfill('0') << offset << "] ";
-        // 打印寄存器名称
-        std::cout << m_registers[offset]->getName() << ": 0x" << std::hex << std::setw(8) << std::setfill('0') << new_value << std::endl;
-        std::fflush(stdout);
-#endif
+    // 固件用 USART_TxData8() 做 8 位写（usart->DATA_B.DATA），这里按访问宽度合并进 32 位寄存器
+    uint32_t new_value = 0;
+    if (size == 4) {
+        new_value = static_cast<uint32_t>(value);
+    } else if (size == 1 || size == 2) {
+        const uint32_t mask = (1U << (size * 8)) - 1U;
+        new_value = (m_registers[offset]->read() & ~mask) | (static_cast<uint32_t>(value) & mask);
     } else {
-         std::cerr << "   [" << getName() << " W: 0x" << std::hex << offset << "] 警告: 访问未注册寄存器!" << std::endl;
+        std::cerr << "   [" << getName() << " W: 0x" << std::hex << offset
+                << "] 警告: 不支持的访问宽度 " << std::dec << size << std::endl;
+        return true;
     }
 
+    m_registers[offset]->write(new_value);
+    plantValueToGuest(uc, address, size, new_value);
+
+    // —— 发送出口：固件写 DATA（低 8 位）就是一个字符，直接吐到 stdout ——
+    if (offset == USART_DATA_OFFSET) {
+        const char ch = static_cast<char>(new_value & 0xFFU);
+        std::cout << ch << std::flush;
+        // 发送瞬时完成：STS 保持复位值 0xC0（TXBEF/TXCF 置位），
+        // 让固件 io_putchar() 里的 TXBE 轮询立刻通过，也把它同步给后续读。
+        if (const auto it = m_registers.find(USART_STS_OFFSET); it != m_registers.end()) {
+            plantValueToGuest(uc, m_base_address + USART_STS_OFFSET, 4, it->second->read());
+        }
+    }
+
+    if (g_periphLog) {
+        std::cout << "   [" << getName() << " W: 0x" << std::hex << std::setw(2) << std::setfill('0')
+                << offset << "] " << m_registers[offset]->getName() << ": 0x" << std::hex
+                << std::setw(8) << std::setfill('0') << new_value << std::endl;
+        std::fflush(stdout);
+    }
     return true;
 }
 
 // 处理读取操作
 bool USART::handle_read(uc_engine *uc, uint64_t address, int size, int64_t *read_value) {
-    if (size != 4) {
-        std::cerr << "   [" << getName() << " R] 警告: 非 32 位读取操作被忽略. 地址: 0x" << std::hex << address << std::endl;
-        *read_value = 0xDEADBEEF;
-        return true;
-    }
+    const auto offset = static_cast<uint32_t>(address - m_base_address);
 
-    auto offset = static_cast<uint32_t>(address - m_base_address);
-    uint32_t stored_value = 0;
-
-    if (m_registers.contains(offset)) {
-        stored_value = m_registers[offset]->read();
-    } else {
+    if (!m_registers.contains(offset)) {
         std::cerr << "   [" << getName() << " R: 0x" << std::hex << offset << "] 警告: 访问未注册寄存器!" << std::endl;
         *read_value = 0;
         return true;
     }
 
+    uint32_t stored_value = m_registers[offset]->read();
+    if (size > 0 && size < 4) {
+        stored_value &= (1U << (size * 8)) - 1U;
+    }
     *read_value = static_cast<int64_t>(stored_value);
+    plantValueToGuest(uc, address, size, stored_value);
 
-#if IS_DEBUG
-    std::cout << "   [" << getName() << " R: 0x" << std::hex << std::setw(2) << std::setfill('0') << offset << "] ";
-    // 打印寄存器名称
-    std::cout << m_registers[offset]->getName() << ": 0x" << std::hex << std::setw(8) << std::setfill('0') << *read_value << std::endl;
-    std::fflush(stdout);
-#endif
-
+    if (g_periphLog) {
+        std::cout << "   [" << getName() << " R: 0x" << std::hex << std::setw(2) << std::setfill('0')
+                << offset << "] " << m_registers[offset]->getName() << ": 0x" << std::hex
+                << std::setw(8) << std::setfill('0') << stored_value << std::endl;
+        std::fflush(stdout);
+    }
     return true;
 }

@@ -21,6 +21,8 @@ add_executable(uc_demo
         main.h
         FirmwareImage.cc
         FirmwareImage.h
+        SysTickModel.cc
+        SysTickModel.h
         peripheral/peripheral_factory.h
         peripheral/GPIO_Port.cc
         peripheral/GPIO_Port.h
@@ -62,9 +64,7 @@ target_include_directories(uc_demo PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         # 2. peripheral 目录 (用于 peripheral_factory.h, Rcm.h, Flash.h 等)
         ${CMAKE_CURRENT_SOURCE_DIR}/peripheral
-        # 3. peripheral/GPIO 目录 (用于 GPIO_Port.h)
-        ${CMAKE_CURRENT_SOURCE_DIR}/peripheral/GPIO
-        # 4. peripheral/Register 目录 (用于 Register.h, RcmRegisters.h, BuzzerRegister.h 等)
+        # 3. peripheral/Register 目录 (用于 Register.h, RcmRegisters.h, BuzzerRegister.h 等)
         ${CMAKE_CURRENT_SOURCE_DIR}/peripheral/Register
 )
 target_link_libraries(uc_demo PRIVATE unicorn_static)

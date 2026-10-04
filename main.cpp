@@ -1,12 +1,14 @@
 #include "main.h" // 包含宏定义和函数声明
 
 #include "FirmwareImage.h"
+#include "SysTickModel.h"
 
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -26,6 +28,8 @@
 
 uc_engine *uc;
 uc_err err;
+// 外设寄存器级日志开关 (默认关: USART 吐的是固件自己打印的字符, 不能被日志混掉)
+bool g_periphLog = false;
 
 namespace {
 
@@ -43,19 +47,35 @@ enum ExitCode {
 // -----------------------------------------------------------------------------
 // 命令行选项
 // -----------------------------------------------------------------------------
+// GPIO 输入预注入: 把某引脚电平钉住 (模拟外部器件驱动该引脚)
+struct GpioInject {
+  char port;   // 'A' - 'D'
+  int pin;     // 0 - 7
+  int level;   // 0 / 1
+};
+
 struct Options {
   std::string firmware;       // 固件路径; 为空时按默认候选路径查找
   ImageFormat format = ImageFormat::Auto;
   uint32_t binBase = FLASH_START;  // .bin 的加载基地址
   uint64_t maxInsns = 1000000;     // 最大执行指令数 (0 = 不限制)
+  bool maxInsnsSet = false;        // 用户是否显式给了 -n (给了 --timeout 时默认不再限制指令数)
   uint64_t timeoutUs = 0;          // 模拟超时, 微秒 (0 = 不限制)
   uint64_t until = 0;              // 执行到该地址时停止 (0 = 不限制)
   bool trace = false;              // 指令级 Hook
   // BLX 目标监视点 (仅在 --trace 下生效), 默认保留原有固件的两个分析点
   std::vector<uint32_t> watchBlx{FLASH_START + 0x1814, FLASH_START + 0x1830};
-  bool periphHooks = false;        // 外设读写 Hook
+  bool periphHooks = true;         // 外设读写 Hook (GPIO/USART 的输入输出都依赖它, 默认开)
   bool mirror = true;              // Flash / ROM 双向镜像写入
   bool quiet = false;              // 精简输出
+  bool periphLog = false;          // 外设寄存器级日志 (默认关, 用 --periph-log 打开)
+  bool gpioPrompt = false;         // 固件读浮空输入时提示用户在终端输入电平(默认关, 见下方说明)
+  std::vector<GpioInject> gpioInjects; // --gpio 预注入的引脚电平
+  bool systick = true;             // 按指令数推进的 SysTick 时钟 (1 指令 = 1 时钟)
+  bool systickIsr = false;         // true = 把固件的 SysTick_Handler 当子程序注入执行
+  bool systickExc = false;         // true = 真异常入口(手动压栈 + EXC_RETURN 跳板)
+  bool clockFaithful = false;      // true = 按固件设置的 LOAD 计时(时间忠实但很慢)
+  uint32_t systickTrampoline = SRAM_START + 0x800; // 中断注入用的 SRAM 跳板地址
 };
 
 // 未指定固件时的默认查找名 (会依次在 exe 目录与工作目录附近查找)
@@ -161,13 +181,31 @@ void printHelp(const char *argv0) {
       "      --no-mirror            不把固件同时镜像写入 Flash 与 ROM\n"
       "\n执行控制:\n"
       "  -n, --max-insns <数量>     最大执行指令数, 0 表示不限制 (默认 1000000)\n"
+      "                             注意: 指定 --timeout 后, 若没显式写 -n 则不再限制指令数\n"
       "      --timeout <微秒>       模拟超时时间, 0 表示不限制 (默认 0)\n"
       "      --until <地址>         执行到该地址时停止 (默认不限制)\n"
       "\n调试选项:\n"
       "  -t, --trace                开启指令级 Hook (逐条打印 PC, 输出量极大)\n"
       "      --watch-blx <地址表>   监视 BLX 目标值, 逗号分隔; 传 none 清空\n"
       "                             (默认 0x08001814,0x08001830, 需配合 -t)\n"
-      "      --hooks                启用外设读写 Hook (默认关闭)\n"
+      "      --hooks                (已默认开启, 保留兼容) 外设读写 Hook\n"
+      "      --no-hooks             关闭外设读写 Hook (GPIO/USART 输入输出会失效)\n"
+      "      --periph-log           额外打印外设寄存器级日志 (默认关, 避免淹没固件打印)\n"
+      "\nGPIO 输入:\n"
+      "      --gpio <注入表>        预注入引脚电平, 如 A3=1,C7=0 (端口 A-D, 引脚 0-7, 默认 1)\n"
+      "      --gpio-prompt          固件读浮空输入时在终端提示输入电平 (默认关)\n"
+      "                             注意: 它会在 Hook 里阻塞等待键盘输入, 阻塞期间\n"
+      "                             --timeout / -n 都无法生效, 只适合纯交互调试\n"
+      "\n时钟:\n"
+      "      --no-systick           关闭 SysTick 时钟(按指令数推进), 固件里的 Delay 会永久忙等\n"
+      "      --systick-isr          改成把固件的 SysTick_Handler 当子程序调用(不做压栈,\n"
+      "                             要求它经 LR 返回; 否则会报错停下)\n"
+      "      --systick-exc          改成真异常入口: 手动压栈 + EXC_RETURN 跳板,\n"
+      "                             handler 当普通代码执行(最接近硬件, 稍慢)\n"
+      "                             (默认: 直接做 __delayCnt--, 不依赖向量表内容, 最快)\n"
+      "      --clock-faithful       按固件设置的 LOAD 重载值计时 (时间忠实, 但 48 拍/微秒会慢 48 倍)\n"
+      "                             (默认: 每条指令算一拍, 忽略 LOAD, 延迟按微秒数直接折算)\n"
+      "      --trampoline <地址>    --systick-isr 时注入用的 SRAM 跳板地址 (默认 0x20000800)\n"
       "  -q, --quiet                精简输出 (外设注册表/Hook 提示/逐条轨迹)\n"
       "  -v, --version              显示版本号\n"
       "  -h, --help                 显示本帮助\n"
@@ -220,6 +258,52 @@ bool parseAddrList(const std::string &text, std::vector<uint32_t> &out, std::str
       return false;
     }
     out.push_back(addr);
+  }
+  return true;
+}
+
+// 解析 "--gpio A3=1,C7=0" 形式的预注入表 (端口字母 + 引脚号 [= 电平, 默认 1])
+bool parseGpioInjections(const std::string &text,
+                         std::vector<GpioInject> &out,
+                         std::string &error) {
+  std::istringstream iss(text);
+  std::string item;
+  while (std::getline(iss, item, ',')) {
+    if (item.empty()) {
+      continue;
+    }
+    std::string spec = item;
+    int level = 1;
+    if (const auto eq = spec.find('='); eq != std::string::npos) {
+      const std::string levelText = spec.substr(eq + 1);
+      if (levelText == "0") {
+        level = 0;
+      } else if (levelText == "1") {
+        level = 1;
+      } else {
+        error = "--gpio 电平只支持 0/1, 收到: " + item;
+        return false;
+      }
+      spec = spec.substr(0, eq);
+    }
+    if (spec.size() < 2) {
+      error = "--gpio 格式应为 <端口><引脚>[=电平], 如 A3=1: " + item;
+      return false;
+    }
+    char port = spec[0];
+    if (port >= 'a' && port <= 'd') {
+      port = static_cast<char>(port - 'a' + 'A');
+    }
+    if (port < 'A' || port > 'D') {
+      error = "--gpio 端口只支持 A/B/C/D, 收到: " + item;
+      return false;
+    }
+    uint64_t pin = 0;
+    if (!parseUint64(spec.substr(1), pin) || pin > 7) {
+      error = "--gpio 引脚号应为 0-7, 收到: " + item;
+      return false;
+    }
+    out.push_back({port, static_cast<int>(pin), level});
   }
   return true;
 }
@@ -309,6 +393,7 @@ ParseResult parseArgs(int argc, char **argv, Options &opt, std::string &error) {
         error = "--max-insns 数量非法: " + value;
         return ParseResult::Error;
       }
+      opt.maxInsnsSet = true;
     } else if (arg == "--timeout") {
       if (!valueFor(arg.c_str())) {
         return ParseResult::Error;
@@ -337,7 +422,40 @@ ParseResult parseArgs(int argc, char **argv, Options &opt, std::string &error) {
         return ParseResult::Error;
       }
     } else if (arg == "--hooks") {
-      opt.periphHooks = true;
+      opt.periphHooks = true; // 现已默认开启, 保留以兼容旧命令行
+    } else if (arg == "--no-hooks") {
+      opt.periphHooks = false;
+    } else if (arg == "--periph-log") {
+      opt.periphLog = true;
+    } else if (arg == "--gpio") {
+      if (!valueFor(arg.c_str())) {
+        return ParseResult::Error;
+      }
+      if (!parseGpioInjections(value, opt.gpioInjects, error)) {
+        return ParseResult::Error;
+      }
+    } else if (arg == "--gpio-prompt") {
+      opt.gpioPrompt = true;
+    } else if (arg == "--no-gpio-prompt") {
+      opt.gpioPrompt = false;
+    } else if (arg == "--systick") {
+      opt.systick = true;
+    } else if (arg == "--no-systick") {
+      opt.systick = false;
+    } else if (arg == "--systick-isr") {
+      opt.systickIsr = true;
+    } else if (arg == "--systick-exc") {
+      opt.systickExc = true;
+    } else if (arg == "--clock-faithful") {
+      opt.clockFaithful = true;
+    } else if (arg == "--trampoline") {
+      if (!valueFor(arg.c_str())) {
+        return ParseResult::Error;
+      }
+      if (!parseAddr(value, opt.systickTrampoline)) {
+        error = "--trampoline 地址非法: " + value;
+        return ParseResult::Error;
+      }
     } else if (arg == "--no-mirror") {
       opt.mirror = false;
     } else if (arg == "-q" || arg == "--quiet") {
@@ -354,6 +472,12 @@ ParseResult parseArgs(int argc, char **argv, Options &opt, std::string &error) {
       opt.firmware = arg;
     }
   }
+  // 给了 --timeout 就按墙钟约束; 除非用户显式写了 -n, 否则不再用默认的指令上限去截断
+  // (否则默认的 100 万条指令会在 1 秒左右就把长超时的运行截断)
+  if (opt.timeoutUs != 0 && !opt.maxInsnsSet) {
+    opt.maxInsns = 0;
+  }
+  g_periphLog = opt.periphLog;
   return ParseResult::Ok;
 }
 
@@ -449,6 +573,13 @@ bool hook_mem_unmapped(uc_engine *uc,
                        int size,
                        int64_t value,
                        void *user_data) {
+  // SysTick 异常返回: handler 的 `bx lr` 跳到 EXC_RETURN 落点(0xFFFFFFF8) —— 这是预期行为,
+  // 交给时钟模型认领并弹栈, 不当作错误报出来。
+  if (SysTickModel *clock = SysTickModel::active(); clock != nullptr &&
+      clock->handleUnmappedFetch(address)) {
+    return false; // 静默停下本轮模拟, 由时钟模型的 run() 弹栈恢复现场
+  }
+
   uint32_t current_pc = 0;
   uc_reg_read(uc, UC_ARM_REG_PC, &current_pc);
   std::cerr << "\n>>>  致命错误: 尝试访问未映射内存!" << std::endl;
@@ -568,7 +699,52 @@ bool setup_VIRTUAL_HF_HANDLER(uc_engine *uc, bool quiet) {
 // -----------------------------------------------------------------------------
 // 外设注册
 // -----------------------------------------------------------------------------
-void registerPeripherals(bool quiet) {
+// -----------------------------------------------------------------------------
+// GPIO 端口注册: 顺便接上「用户输入」
+//   1. --gpio 预注入的引脚电平
+//   2. 固件读浮空输入时, 在终端提示用户输入电平 (默认开, --no-gpio-prompt 关)
+// -----------------------------------------------------------------------------
+void registerGpioPort(uint64_t base, char letter, const Options &opt) {
+  auto port = std::make_unique<GPIO_Port>(base, std::string(1, letter));
+
+  for (const GpioInject &inj : opt.gpioInjects) {
+    if (inj.port != letter) {
+      continue;
+    }
+    port->driveInput(static_cast<uint8_t>(1U << inj.pin), inj.level);
+    if (!opt.quiet) {
+      std::cout << "  - GPIO" << letter << " P" << std::dec << inj.pin
+          << " 预注入电平 = " << inj.level << std::endl;
+    }
+  }
+
+  if (opt.gpioPrompt) {
+    const std::string portName(1, letter);
+    port->setInputQuery([portName](int pin, int &level) {
+      std::cout << "\n[GPIO" << portName << "] P" << pin
+          << " 浮空输入被固件读取, 请输入电平 (0/1, 回车=0, 其它=不注入): " << std::flush;
+      std::string line;
+      if (!std::getline(std::cin, line)) {
+        return false; // 非交互或 EOF: 不注入, 走默认低电平
+      }
+      if (line.empty() || line == "0") {
+        level = 0;
+        return true;
+      }
+      if (line == "1") {
+        level = 1;
+        return true;
+      }
+      return false;
+    });
+  }
+
+  // DIN 的初值由 PeripheralDevice::plantInitialValues() 统一种入 guest 内存
+  PeripheralRegistry::getInstance().registerDevice(std::move(port));
+}
+
+void registerPeripherals(const Options &opt) {
+  const bool quiet = opt.quiet;
   if (!quiet) {
     std::cout << "--- 注册外设驱动 ---" << std::endl;
   }
@@ -582,10 +758,10 @@ void registerPeripherals(bool quiet) {
   registry.registerDevice(std::make_unique<Iwdt>());   // 0x4000 2000
   registry.registerDevice(std::make_unique<Wwdt>());   // 0x4000 1C00
   registry.registerDevice(std::make_unique<EINT>());   // 0x4000 1800
-  registry.registerDevice(std::make_unique<GPIO_Port>(GPIOD_BASE, "D"));
-  registry.registerDevice(std::make_unique<GPIO_Port>(GPIOC_BASE, "C"));
-  registry.registerDevice(std::make_unique<GPIO_Port>(GPIOB_BASE, "B"));
-  registry.registerDevice(std::make_unique<GPIO_Port>(GPIOA_BASE, "A"));
+  registerGpioPort(GPIOD_BASE, 'D', opt);
+  registerGpioPort(GPIOC_BASE, 'C', opt);
+  registerGpioPort(GPIOB_BASE, 'B', opt);
+  registerGpioPort(GPIOA_BASE, 'A', opt);
   registry.registerDevice(std::make_unique<USART>(USART1_BASE, "USART1")); // 0x4000 3400
   registry.registerDevice(std::make_unique<USART>(USART2_BASE, "USART2")); // 0x4000 1400
   registry.registerDevice(std::make_unique<USART>(USART3_BASE, "USART3")); // 0x4000 4800
@@ -595,6 +771,14 @@ void registerPeripherals(bool quiet) {
   registry.registerDevice(std::make_unique<GenericPeripheral>("TMR2", 0x40003C00));
   registry.registerDevice(std::make_unique<GenericPeripheral>("TMR1", 0x40003800));
   registry.registerDevice(std::make_unique<GenericPeripheral>("TMR1A", 0x40001000));
+
+  // 把各设备的寄存器复位值种进 guest 内存。
+  // 固件读的是映射 RAM, 而 Unicorn 的读 Hook 在读取完成之后才触发、改不了本次读到的值;
+  // 不种进去的话固件一律读到 0 —— 例如 RCM_MCS 读成 0 会让 RCM_GetMasterClockFreq()
+  // 返回 0, SysTick_Config(0) 失败, 固件直接卡在 APM_DelayInit() 的 while(1)。
+  for (const auto &[base, device] : registry.getDevices()) {
+    device->plantInitialValues(uc);
+  }
 
   if (!quiet) {
     for (const auto &[base, device] : registry.getDevices()) {
@@ -832,7 +1016,7 @@ int main(int argc, char **argv) {
   // ----------------------
   // 4.1 实例化和注册外设
   // ----------------------
-  registerPeripherals(opt.quiet);
+  registerPeripherals(opt);
 
   // ----------------------
   // 4.2 设置 HardFault 重定向与 Hook
@@ -850,6 +1034,58 @@ int main(int argc, char **argv) {
   }
 
   // ----------------------
+  // 4.3 时钟: 按指令数推进的 SysTick (1 指令 = 1 时钟)
+  //     固件的 Delay_us/ms() 靠 SysTick 中断递减 __delayCnt, 没有它就会永久忙等
+  // ----------------------
+  std::unique_ptr<SysTickModel> sysTick;
+  if (opt.systick) {
+    // 向量表基址: 固件以 0x00000000 链接 (向量表在 ROM, 同时被镜像到 Flash);
+    // 若 ROM 里读不到向量则退回 Flash
+    uint32_t vectorBase = ROM_START;
+    uint32_t handler = 0;
+    if (uc_mem_read(uc,
+                    ROM_START + SysTickModel::kVectorOffset,
+                    &handler,
+                    sizeof(handler)) != UC_ERR_OK ||
+        handler == 0) {
+      vectorBase = FLASH_START;
+    }
+
+    sysTick = std::make_unique<SysTickModel>(uc,
+                                             vectorBase,
+                                             opt.systickTrampoline,
+                                             std::initializer_list<std::pair<uint64_t, uint64_t>>{
+                                                 {FLASH_START, FLASH_END - 1},
+                                                 {ROM_START, ROM_START + ROM_SIZE - 1},
+                                             });
+    std::string sysTickError;
+    if (opt.systickExc) {
+      sysTick->setMode(SysTickModel::Mode::Exception);
+    } else if (opt.systickIsr) {
+      sysTick->setMode(SysTickModel::Mode::Subroutine);
+    } else {
+      sysTick->setMode(SysTickModel::Mode::Direct);
+    }
+    sysTick->setHonorLoad(opt.clockFaithful);
+    if (!sysTick->install(sysTickError)) {
+      std::cerr << "错误: SysTick 时钟初始化失败 - " << sysTickError << std::endl;
+      uc_close(uc);
+      return EXIT_UC;
+    }
+    if (!opt.quiet) {
+      const char *clockMode = opt.systickExc ? "真异常入口(压栈+EXC_RETURN)"
+                              : opt.systickIsr ? "注入 ISR(当子程序调用)"
+                                               : "直接递减延时计数";
+      std::cout << "[时钟] 1 指令 = 1 时钟, 向量表 " << hex(vectorBase) << ", SysTick 向量 "
+          << (sysTick->handlerAvailable() ? hex(sysTick->handlerAddress())
+                                          : std::string("无"))
+          << ", 方式: " << clockMode
+          << (opt.clockFaithful ? ", 速率: 忠实(按 LOAD)" : ", 速率: 演示(每指令一拍)")
+          << std::endl;
+    }
+  }
+
+  // ----------------------
   // 5. 启动模拟
   // ----------------------
   if (!opt.quiet) {
@@ -857,17 +1093,37 @@ int main(int argc, char **argv) {
   }
 
   const auto start = std::chrono::high_resolution_clock::now();
-  err = uc_emu_start(uc,
-                     start_pc,
-                     opt.until,
-                     opt.timeoutUs,
-                     static_cast<size_t>(opt.maxInsns));
+  if (sysTick) {
+    err = sysTick->run(start_pc, opt.until, opt.timeoutUs, opt.maxInsns);
+  } else {
+    err = uc_emu_start(uc,
+                       start_pc,
+                       opt.until,
+                       opt.timeoutUs,
+                       static_cast<size_t>(opt.maxInsns));
+  }
   const auto end = std::chrono::high_resolution_clock::now();
   const auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
 
   std::cout << "执行时间: " << std::dec << duration.count() << " ns" << std::endl;
   if (opt.trace) {
     std::cout << "执行指令数: " << g_trace.instructions << std::endl;
+  }
+  if (sysTick && !opt.quiet) {
+    std::cout << "[时钟] SysTick 节拍 " << std::dec << sysTick->interrupts()
+        << " 次, 执行指令 " << sysTick->instructions() << " 条";
+    if (opt.systickExc) {
+      std::cout << ", 异常入口 " << sysTick->exceptions() << " 次";
+    } else if (!opt.systickIsr) {
+      std::cout << ", 延时计数变量 "
+          << (sysTick->delayCounterAddress() != 0 ? hex(sysTick->delayCounterAddress())
+                                                  : std::string("未捕获(固件没调用过 Delay)"));
+    }
+    std::cout << std::endl;
+  }
+  // 时钟模型报的错即使 -q 也要打印出来(否则卡死了看不出原因)
+  if (sysTick && !sysTick->lastError().empty()) {
+    std::cerr << "[时钟] " << sysTick->lastError() << std::endl;
   }
 
   int exitCode = EXIT_OK;
@@ -888,14 +1144,20 @@ int main(int argc, char **argv) {
     // 区分几种正常停止的原因, 便于判断固件是否真的跑完
     // (Unicorn 对停止原因统一返回 UC_ERR_OK, 这里按 PC / 耗时 / 指令数反推)
     const double elapsedUs = static_cast<double>(duration.count()) / 1000.0;
+    const bool insnsKnown = sysTick != nullptr || opt.trace;
+    const uint64_t executed = sysTick ? sysTick->instructions() : g_trace.instructions;
+    const bool hitInsnLimit = opt.maxInsns != 0 && (!insnsKnown || executed >= opt.maxInsns);
+    const bool hitTimeout = opt.timeoutUs != 0 && elapsedUs >= static_cast<double>(opt.timeoutUs);
     std::string reason;
     if (opt.until != 0 && (final_pc & ~1u) == (opt.until & ~1u)) {
       reason = "命中停止地址 " + hex(opt.until);
-    } else if (opt.timeoutUs != 0 && elapsedUs >= static_cast<double>(opt.timeoutUs)) {
-      reason = "达到模拟超时 " + std::to_string(opt.timeoutUs) + " us";
-    } else if (opt.maxInsns != 0 &&
-               (!opt.trace || g_trace.instructions >= opt.maxInsns)) {
+    } else if (hitInsnLimit && hitTimeout) {
+      reason = "达到指令上限 " + std::to_string(opt.maxInsns) + " 条, 同时已超过模拟超时 " +
+          std::to_string(opt.timeoutUs) + " us (两者都设了, 先到先停)";
+    } else if (hitInsnLimit) {
       reason = "达到指令上限 " + std::to_string(opt.maxInsns) + " (可能尚未执行完)";
+    } else if (hitTimeout) {
+      reason = "达到模拟超时 " + std::to_string(opt.timeoutUs) + " us";
     } else {
       reason = "固件执行结束";
     }

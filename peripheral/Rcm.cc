@@ -42,6 +42,19 @@ void RCM::initialize_registers() {
 }
 
 
+// 把寄存器复位值种进 guest 内存。
+// 固件读的是映射 RAM, 而 Unicorn 的读 Hook 改不了本次读到的值:
+// 不种进去的话 RCM_MCS 会读成 0, RCM_GetMasterClockFreq() 返回 0,
+// 固件的 APM_DelayInit() 会因 SysTick_Config(0) 失败而卡死。
+void RCM::plantInitialValues(uc_engine *uc) {
+  if (uc == nullptr) {
+    return;
+  }
+  for (const auto &[offset, reg] : m_registers) {
+    plantValueToGuest(uc, RCM_BASE + offset, 4, reg->read());
+  }
+}
+
 // 处理写入操作
 bool RCM::handle_write(uc_engine *uc, uint64_t address, int size, int64_t value) {
   if (size != 4) {
@@ -140,6 +153,8 @@ bool RCM::handle_read(uc_engine *uc, uint64_t address, int size, int64_t *read_v
 
 
   *read_value = static_cast<int64_t>(stored_value);
+  // 本次读已结束, 把模型值种回内存, 让固件后续的读(含读-改-写)看到同一份寄存器内容
+  plantValueToGuest(uc, address, 4, stored_value);
 
 #if IS_DEBUG
   std::cout << "   [CMU R: 0x" << std::hex << std::setw(2) << std::setfill('0') << offset << "] ";

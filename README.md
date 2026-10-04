@@ -13,7 +13,11 @@
 | 固件加载 | `.bin` / `.hex`(Intel HEX) / `.elf`(ELF32) 三种格式,自动识别 |
 | 启动复位 | 从向量表取出初始 SP 与复位 PC,按 Cortex-M 规则进入 Thumb 模式 |
 | 执行追踪 | `-t` 开启指令级 Hook,可监视指定 BLX 指令的跳转目标 |
-| 外设建模 | 21 个外设按「寄存器 + 位域」建模,`--hooks` 启用读写分发 |
+| 外设建模 | 21 个外设按「寄存器 + 位域」建模,外设读写分发默认开启(`--no-hooks` 关闭) |
+| USART 输出 | 固件写 `DATA`(8/16 位访问)即把字符打到 stdout |
+| GPIO 输入 | 读 `DIN` 时动态合成:外部注入 > 输出回读 `DOUT` > 上拉=1 > 浮空(提示用户在终端输入) |
+| GPIO 输出 | 固件写 `DOUT` 时打印引脚电平跳变 |
+| 寄存器日志 | 由 `--periph-log` 控制(默认关闭,避免淹没固件打印) |
 | 内存防护 | 固件写入前校验目标区域,运行期捕获未映射访问并打印 PC |
 | 跑飞兜底 | 虚拟 HardFault Handler(`B .` 死循环),异常不会静默跑飞 |
 | 执行控制 | 指令数上限、模拟超时、运行到指定地址停止 |
@@ -30,8 +34,8 @@ uc_demo
 uc_demo firmware/firmware.hex
 uc_demo firmware/firmware.elf
 
-# 启用外设读写分发,并把固件跑到 0x08001A00 为止
-uc_demo -f firmware/firmware.bin --hooks --until 0x08001A00
+# 把矩阵键盘某行拉低(等价于按住一个键),并把固件跑到 0x08001A00 为止
+uc_demo -f firmware/firmware.bin --gpio C7=0 --until 0x08001A00
 
 # 查看全部参数
 uc_demo --help
@@ -70,12 +74,20 @@ uc_demo [选项] [固件文件]
 | `--format <bin\|hex\|elf\|auto>` | 强制指定格式,默认 `auto`(按扩展名 + 文件头魔数识别) |
 | `--base <地址>` | `.bin` 的加载基地址,默认 `0x08000000` |
 | `--no-mirror` | 关闭 Flash ↔ ROM 双向镜像写入(排障用,见 §4.3) |
-| `-n, --max-insns <数量>` | 最大执行指令数,`0` 表示不限制,默认 `1000000` |
+| `-n, --max-insns <数量>` | 最大执行指令数,`0` 表示不限制,默认 `1000000`;指定了 `--timeout` 且没显式写 `-n` 时不限制指令数 |
 | `--timeout <微秒>` | 模拟超时时间,`0` 表示不限制 |
 | `--until <地址>` | 执行到该地址时停止,带不带 Thumb 位均可 |
 | `-t, --trace` | 开启指令级 Hook,逐条打印 PC(**输出量极大**) |
 | `--watch-blx <地址表>` | 监视 BLX 前的 `r3` 值,逗号分隔;传 `none` 清空。需配合 `-t` |
-| `--hooks` | 启用外设读写 Hook(默认关闭) |
+| `--hooks` | 启用外设读写 Hook(已默认开启,保留兼容) |
+| `--no-hooks` | 关闭外设读写 Hook(GPIO / USART 的输入输出会失效) |
+| `--periph-log` | 额外打印外设寄存器级日志(默认关闭) |
+| `--gpio <注入表>` | 预注入引脚电平,如 `A3=1,C7=0`(端口 A-D,引脚 0-7,省略电平默认 1) |
+| `--gpio-prompt` | 固件读浮空输入时在终端提示输入电平(默认关; 会在 Hook 里阻塞等输入, 期间 `--timeout` / `-n` 失效) |
+| `--no-systick` | 关闭按指令数推进的 SysTick 时钟(固件里的 `Delay` 会永久忙等) |
+| `--systick-isr` | 时钟到点时把固件的 `SysTick_Handler` 当子程序调用(不做压栈,要求它经 LR 返回) |
+| `--systick-exc` | 时钟到点时走**真异常入口**:手动压栈 + `EXC_RETURN` 跳板,handler 当普通代码执行(最接近硬件,较慢) |
+| `--clock-faithful` | 按固件设置的 `LOAD` 重载值计时(时间忠实,但慢 48 倍;默认每条指令一拍) |
 | `-q, --quiet` | 精简输出:外设注册表、Hook 提示、逐条轨迹都不打印 |
 | `-v, --version` / `-h, --help` | 版本 / 帮助 |
 
@@ -207,7 +219,9 @@ uc_demo [选项] [固件文件]
 | BUZZER | `0x40002800` | 独立模型(`BuzzerRegister.h`) |
 | WUPT / ADC / TMR1 / TMR2 / TMR4 / TMR1A | `0x40002400` / `4400` / `3800` / `3C00` / `4000` / `1000` | `GenericPeripheral` 占位:只记录访问,不建模行为 |
 
-寄存器级日志由 `main.h` 中的 `IS_DEBUG` 统一开关(`#if IS_DEBUG`)。
+寄存器级日志由 `main.h` 的 `IS_DEBUG` 编译期宏与 `--periph-log` 运行时开关共同控制(USART / GPIO 已改为运行时判断,其余外设仍是编译期宏)。
+GPIO 与 USART 已不只是"记日志":GPIO 读 `DIN` 时按引脚合成电平(外部注入 > 输出回读 > 上拉 > 浮空),USART 写 `DATA` 时把字符输出到 stdout。
+目标固件的引脚、流程与观测点见 [`docs/FIRMWARE.md`](docs/FIRMWARE.md),当前进度与剩余工作见 [`docs/ENGINEERING_PLAN.md`](docs/ENGINEERING_PLAN.md)。
 
 ---
 
@@ -237,9 +251,10 @@ public:
 
 ## 9. 已知限制
 
-- **外设仅到寄存器级**:USART 不产生字符输出、GPIO 不驱动外部器件,只能通过访问日志观察行为;
-- **无中断注入**:没有定时器/NVIC 事件源,固件进入 `while(1)` 空转后不会自行结束
-  (上面的示例固件就停在 `0x0800127A` 的等待循环),需靠 `-n` / `--timeout` 结束;
+- **外设行为只做了 GPIO / USART**:USART 只发不收、不建模波特率与位时序;GPIO 不做中断、边沿检测与外部器件时序(PS/2 位流、按键去抖都没有);其余外设仍只记录访问;
+- **时钟尚未接线**:SysTick 没有中断源,固件里的 `Delay_us/ms/s()` 会永久忙等
+  (`__delayCnt` 只由 `SysTick_Handler` 递减),示例固件因此停在 `PS2_BOOT()` 的
+  `Delay_ms(300)`,不会自行结束,需靠 `-n` / `--timeout` / `--until` 结束;
 - **PPB 区域是普通内存**:读写 `0xE0000000` 起的内存不会触发真实的 NVIC/SysTick 行为;
 - **不做外设写入的合法性检查**:未注册的地址只打印「未注册的设备地址」,不报错;
 - **初始 SP 越界仅警告**(不在 SRAM 范围内时提示,但继续执行);
@@ -257,13 +272,16 @@ uc_demo/
 ├── main.h                    # 架构/模式、内存布局宏、版本号、IS_DEBUG
 ├── FirmwareImage.h/.cc       # 固件加载器: bin / Intel HEX / ELF32 + 路径解析
 ├── CMakeLists.txt
+├── SysTickModel.h/.cc         # SysTick 时钟模型(1 指令 = 1 时钟, 已写好但尚未接线)
+├── docs/
+│   ├── FIRMWARE.md            # 目标固件源码说明: 引脚 / 流程 / 观测点
+│   └── ENGINEERING_PLAN.md    # 工程现状与剩余工作
 ├── firmware/                 # 示例固件 (.bin/.hex/.elf 同一镜像) 与分析资料
 └── peripheral/
     ├── peripheral_factory.h/.cc   # PeripheralDevice 基类 + PeripheralRegistry + GenericPeripheral
     ├── GPIO_Port.*  Rcm.*  Flash.*  Usart.*  I2c.*  Spi.*
     ├── Eint.*  Iwdt.*  Wwdt.*  Buzzer.*
-    ├── Register/             # Register / BitField 抽象 + 各外设寄存器描述
-    └── Timer/                # 预留
+    └── Register/             # Register / BitField 抽象 + 各外设寄存器描述
 ```
 
 ---

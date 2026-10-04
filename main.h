@@ -44,4 +44,8 @@ const unsigned char hardfault_code[] = {0xFE, 0xE7}; // B . 永远循环指令
 #define IS_DEBUG true
 // 指令级监视 (UC_HOOK_CODE) 改为运行时开关, 见 uc_demo --help 的 -t/--trace
 
+// 外设寄存器级日志的运行时开关 (默认关闭, 由 --periph-log 打开)
+// USART 输出的是固件自己打印的字符, 不能被寄存器日志混在一起
+extern bool g_periphLog;
+
 extern uc_engine *uc;
